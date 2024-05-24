@@ -146,7 +146,12 @@ while not success:
     else:
         print("ok, running repair")
         diff = subprocess.run(["git","diff"],stdout=subprocess.PIPE).stdout.decode()
-        i,j= aio.run(get_broken_proof(flags, sentences)) 
+        out = aio.run(get_broken_proof(flags, sentences)) 
+        if out is None:
+            # this happens sometimes. something something parallel rebuilds.
+            print("didn't find the error in the last compiled file. trying to rebuild again.")
+            print("kill this process if we get stuck in a loop, please.")
+            continue
         aio.run(repair_proof(sentences,i,j,diff,flags))
         break
 

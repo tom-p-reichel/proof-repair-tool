@@ -13,9 +13,10 @@ from dataclasses import dataclass
 import prism.util.alignment as  align
 import random
 import re
+from functools import lru_cache
 
 
-prefix_alignment  = align.align_factory(lambda x,y : align.fast_edit_distance(x,y),lambda x: len(x),select_best=lambda D: (D[:,-1].argmin(),D.shape[1]-1),numba=False)
+prefix_alignment  = align.align_factory(lru_cache(maxsize=30000)(lambda x,y : align.fast_edit_distance(x,y)),lambda x: len(x),select_best=lambda D: (D[:,-1].argmin(),D.shape[1]-1),numba=False)
 
 
 """
@@ -71,7 +72,7 @@ class StackManager():
             ctxstack,coq,ctxlock = ctx
             async with ctxlock:
                 ctx[0] = stack
-                stdout,stderr = await coq.run(f"BackTo {self.offset}.\n"+"\n".join(f"timeout 1 {x}" if x[0].islower() else x  for x in stack)+"\nShow.",return_stderr=True)
+                stdout,stderr = await coq.run(f"BackTo {self.offset}.\n"+"\n".join(f"timeout 1 {x}" if x[0].islower() else x  for x in stack),return_stderr=True)
                 output = await coq.run("Show.")
 
         if "Error" in stderr:
@@ -201,7 +202,7 @@ def trim_kvs(kvs,l):
     
 
 @torch.no_grad()
-def sample(model,tokenizer,prompt,temperature=0.75):
+def sample(model,tokenizer,prompt,temperature=0.60):
     logits = {}
 
     prompt_tokens = tokenizer([prompt], return_tensors="pt")
@@ -209,7 +210,6 @@ def sample(model,tokenizer,prompt,temperature=0.75):
     tmp = model(**prompt_tokens, use_cache=True)
     cache = ((), tmp.past_key_values)
     logits[()] = torch.nn.functional.softmax(tmp.logits[0,-1,:]/temperature)
-    del tmp
     
     stack = []
     
@@ -223,28 +223,31 @@ def sample(model,tokenizer,prompt,temperature=0.75):
                     break
 
             if prefix_length == len(stack):
+                print("really weird at", tokenizer.decode(stack), stack)
                 prefix_length -= 1
-                print("weird cache inaccuracy...")
-            
+
+
             tmp = model(torch.tensor([stack[prefix_length:]]),use_cache=True,past_key_values=trim_kvs(cache[1], prefix_length+prompt_length))
             
             logits[tuple(stack)] = torch.nn.functional.softmax(tmp.logits[0,-1,:]/temperature)
             
             cache = (tuple(stack), tmp.past_key_values)
 
-            del tmp
-
         p = logits[tuple(stack)] 
 
-        stack.append(torch.multinomial(p,1)[0])
+        stack.append(torch.multinomial(p,1)[0].item())
 
         if tokenizer.decode(stack).endswith("\n```") and len(stack)>0:
             yield tokenizer.decode(stack)[:-4]
+            
+            
+            # trim off the ".\n```"
+            
+            stack = stack[:-3]
             prob = 1.0
             for i in range(len(stack)):
                 prob *= logits[tuple(stack[:-i-1])][stack[-i-1]]
                 logits[tuple(stack[:-i-1])][stack[-i-1]] -= prob
-            print("excised",prob)
             stack = []
 
 
@@ -293,7 +296,7 @@ def mkprompt(tok,diff,proof_history,proof_pane, budget=2048):
 
     #random.shuffle(blocks)
 
-    return "\n".join(blocks) + "\nNext Tactic:\n```\n"
+    return "\n\n".join(blocks) + "\nNext Tactic:\n```\n"
 
 
 bnb_config = BitsAndBytesConfig(
@@ -303,7 +306,8 @@ bnb_4bit_compute_dtype=torch.float16
 
 base_dir = "/home/tpr/s2loop/"
 
-m = AutoModelForCausalLM.from_pretrained(f"{base_dir}/base_model/",device_map="auto", use_cache=False, quantization_config=bnb_config)
+m = AutoModelForCausalLM.from_pretrained(f"{base_dir}/base_model/",device_map="auto", use_cache=False, quantization_config=bnb_config,
+        attn_implementation="flash_attention_2")
 
 m.load_adapter(f"{base_dir}/model/","tactic")
 
@@ -324,6 +328,16 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags):
     state = await stack_manager.evaluate([])
 
     for _ in range((proof_end-proof_start)*2):
+
+        test = await stack_manager.evaluate(stack + ["Qed."]) 
+        if test is not None:
+            print("we did it!")
+            print(test)
+            break
+        else:
+            print("not done yet.")
+
+
         print(stack)
         alignment = prefix_alignment([x.text for x in sentences[proof_start:proof_end]], stack)
 
@@ -344,8 +358,8 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags):
                 proof_history.append(f"+  {y}")
         
         recommendation = sentences[old_cnt+proof_start].text
-
-        proof_history.append(f"?  {recommendation}")
+        for s in sentences[old_cnt+proof_start:old_cnt+proof_start+3]:
+            proof_history.append(f"?  {s.text}")
 
         if (await stack_manager.evaluate(stack+[recommendation])) is not None: 
             # ok, it looks like the original proof still works here.
@@ -355,8 +369,8 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags):
 
         # we might need a bullet and i didn't train the model to use them.
         # just try them all really fast.
-        for bullet in ["-","+","*","}"]:
-            if (await 
+        #for bullet in ["-","+","*","}"]:
+        #:    if (await 
 
         
         proof_pane = await stack_manager.evaluate(stack)
@@ -370,18 +384,21 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags):
 
         s = sample(m,tokenizer,prompt)
 
+        print(prompt)
 
         while True:
             tactic = (next(s))
+            print(tactic)
             # TODO: real search logic...
             tactic = re.sub(r"<LOOKUP>([^\s]+) : .+?<\/LOOKUP>", r" \1 ", tactic)
 
-            if not tactic[0].islower():
+            if tactic[0].isupper():
                 continue
 
-            print(tactic)
-            
-            attempt = await stack_manager.evaluate(stack + [tactic])
+            if tactic[0].islower():
+                attempt = await stack_manager.evaluate(stack + [f"progress {tactic}"])
+            else:
+                attempt = await stack_manager.evaluate(stack + [tactic])
 
             if attempt is not None:
                 stack.append(tactic)
@@ -389,20 +406,6 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags):
 
 
     return stack
-
-
-
-
-
-
-
-
-
-        
-
-
-
-
 
 
 
