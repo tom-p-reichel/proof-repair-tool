@@ -15,20 +15,9 @@ import random
 import re
 from functools import lru_cache
 
-
 prefix_alignment  = align.align_factory(lru_cache(maxsize=30000)(lambda x,y : align.fast_edit_distance(x,y)),lambda x: len(x),select_best=lambda D: (D[:,-1].argmin(),D.shape[1]-1),numba=False)
 
 
-"""
-model_base = "./base_model/"
-
-# TODO: this quantization config is not quite right!
-
-"""
-
-
-
-import asyncio as aio
 
 
 class StackManager():
@@ -84,113 +73,6 @@ class StackManager():
             return output
 
 
-
-class CoqStoppingCriteria(StoppingCriteria):
-    def __init__(self,tokenizer):
-        self.banned = []
-        self.banned.append(tokenizer("\n```",add_special_tokens=False,return_tensors="pt")["input_ids"][0])
-        # this better not be true or else the tokenizer can eat the \n.
-        assert(all(".\n" not in x for x in tokenizer.get_vocab()))
-
-    def __call__(self,ids,scores,**args):
-        return all(".\n```" in x for x in (tokenizer.decode(x).split("[SEP]")[-1] for x in ids))
-
-
-class ModelManager():
-    @dataclass
-    class Request():
-        prompt : str 
-
-    def __init__(self,model,tokenizer,environment,batch_size=12,cache_path=Path("~/.cache/yapsrt/vecs.pk").expanduser()):
-        self.m = model
-        self.tokenizer = tokenizer
-        self.queue = aio.PriorityQueue()
-        self.env = environment
-        self.serving = False
-        self.counter = 0
-        self.bad_words = [[y] for x,y in tokenizer.get_vocab().items() if ";" in x or "(*" in x]
-        self.stoppers = [CoqStoppingCriteria(tokenizer)]
-
-        """
-        if Path(cache_path).exists():
-            with open(cache_path,"rb") as f:
-                try:
-                    cache = pickle.load(f)
-                except:
-                    cache = {}
-        else:
-            Path(cache_path).parent.mkdir(exist_ok=True)
-            cache = {}
-        self.m.set_adapter("search")
-        new_thms = [(k,v) for k,v in self.env.items() if (k,v) not in cache]
-
-        for k,v in tqdm([(k,v) for k,v in self.env.items() if (k,v) not in cache],desc="vectorizing env"):
-            with torch.no_grad():
-                cache[k,v] = torch.nn.functional.normalize(self.m.model(**self.tokenizer(f"{k} : {v}", return_tensors="pt")).last_hidden_state[:,-1]).cpu()
-
-        with open(cache_path,"wb") as f:
-            pickle.dump(cache,f)
-
-        # pick an order
-        self.vec_thms = [k for k in self.env.keys()]
-
-        self.vecs = torch.vstack([cache[k,v] for k,v in self.env.items()]).cuda().half()
-        """
-
-    def eval_request(self,request,n=10):
-
-        with torch.no_grad():
-            try:
-                #self.m.set_adapter("tactic")
-                results = self.m.generate(
-                    **self.tokenizer(request,return_tensors="pt"),
-                    num_beams=n,
-                    do_sample=False,
-                    stopping_criteria=self.stoppers,
-                    use_cache=True,
-                    max_new_tokens=40,
-                    num_return_sequences=n,
-                    bad_words_ids=self.bad_words,
-                    output_hidden_states=True,
-                    return_dict_in_generate=True,
-                    output_scores=True,
-                    length_penalty=0.0
-                )
-            except torch.cuda.OutOfMemoryError:
-                return None
-       
-        tactics = [tokenizer.decode(x).split("[SEP]")[-1].split("\n")[0].strip() for x in results["sequences"]]
-        states = [[y.to("cpu").clone() for y in x] for x in results["hidden_states"]]
-        seq_scores = results["sequences_scores"]
-
-        del results
-
-        #self.m.set_adapter("search")
-
-        #goal_hash = torch.vstack(pattern_vecs).mean(axis=0).float().cpu().numpy()
-             
-
-        return {"tactics":tactics,"hidden_states":states,"scores":seq_scores} #, "hash": goal_hash}
-
-
-    async def serve(self):
-        buf = []
-        while True:
-            priority,(request,future) = await self.queue.get()
-            print("handling priority level", priority)
-            # check if it's cancelled
-            out = await aio.to_thread(self.eval_request,request)
-            future.set_result(out)
-
-    async def evaluate(self,prompt,priority=0.0):
-        loop = aio.get_event_loop()
-        if not self.serving:
-            self.serving = True
-            aio.ensure_future(self.serve())
-        future = loop.create_future()
-        self.counter += 1
-        await self.queue.put(((priority,self.counter),(prompt,future)))
-        return (await future)
 
 
 def trim_kvs(kvs,l):
@@ -249,7 +131,6 @@ def sample(model,tokenizer,prompt,temperature=0.60,maxlength=1024):
                 logits[tuple(stack[:-i-1])][stack[-i-1]] -= prob
             stack = []
 
-    return "i give up."
 
 
 def tokenize_glb_chunks(tok,chunks,m):
@@ -370,11 +251,6 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock):
             stack.append(sentences[old_cnt+proof_start].text)
             continue
 
-        # we might need a bullet and i didn't train the model to use them.
-        # just try them all really fast.
-        #for bullet in ["-","+","*","}"]:
-        #:    if (await 
-
         
         proof_pane = await stack_manager.evaluate(stack)
 
@@ -411,25 +287,3 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock):
         return None
 
     return stack
-
-
-
-import time
-async def main():
-    """
-    print(await stack_manager.evaluate(("intros.", "try auto.")))
-    print(await stack_manager.evaluate(("intros.","pose 1 as e.", "try auto.")))
-    print(await stack_manager.evaluate(("intros.", "pose 1 as e.")))
-    print(await stack_manager.evaluate(("intros.", "pose 1 as e.","yabba dabba doo.")))
-    """
-
-    start = time.time()
-    print(await solve_proof(text))
-    print("elapsed",time.time()-start)
-    #print("model invoks:",model_manager.counter)
-
-
-
-if __name__=="__main__":
-    pass
-    aio.run(main())
