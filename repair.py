@@ -202,7 +202,7 @@ def trim_kvs(kvs,l):
     
 
 @torch.no_grad()
-def sample(model,tokenizer,prompt,temperature=0.60):
+def sample(model,tokenizer,prompt,temperature=0.60,maxlength=1024):
     logits = {}
 
     prompt_tokens = tokenizer([prompt], return_tensors="pt")
@@ -237,18 +237,19 @@ def sample(model,tokenizer,prompt,temperature=0.60):
 
         stack.append(torch.multinomial(p,1)[0].item())
 
-        if tokenizer.decode(stack).endswith("\n```") and len(stack)>0:
-            yield tokenizer.decode(stack)[:-4]
-            
-            
+        if len(stack)>maxlength or (tokenizer.decode(stack).endswith("\n```") and len(stack)>0):
+
+            if len(stack) <= maxlength:
+                yield tokenizer.decode(stack)[:-4]
             # trim off the ".\n```"
-            
             stack = stack[:-3]
             prob = 1.0
             for i in range(len(stack)):
                 prob *= logits[tuple(stack[:-i-1])][stack[-i-1]]
                 logits[tuple(stack[:-i-1])][stack[-i-1]] -= prob
             stack = []
+
+    return "i give up."
 
 
 def tokenize_glb_chunks(tok,chunks,m):
@@ -313,7 +314,8 @@ m.load_adapter(f"{base_dir}/model/","tactic")
 
 tokenizer = AutoTokenizer.from_pretrained(f"{base_dir}/base_model/")
 
-async def repair_proof(sentences,proof_start,proof_end,diff,flags):
+
+async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock):
     coq = CoqProcess(*flags.split())
     await coq.run("\n".join(x.text for x in sentences[:proof_start]))
     env = await coq.environment()
@@ -333,6 +335,7 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags):
         if test is not None:
             print("we did it!")
             print(test)
+            print(stack)
             break
         else:
             print("not done yet.")
@@ -387,7 +390,8 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags):
         print(prompt)
 
         while True:
-            tactic = (next(s))
+            async with gpu_lock:
+                tactic = await aio.to_thread(next,s)
             print(tactic)
             # TODO: real search logic...
             tactic = re.sub(r"<LOOKUP>([^\s]+) : .+?<\/LOOKUP>", r" \1 ", tactic)
@@ -403,7 +407,8 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags):
             if attempt is not None:
                 stack.append(tactic)
                 break
-
+    else:
+        return None
 
     return stack
 

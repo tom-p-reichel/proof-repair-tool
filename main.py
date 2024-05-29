@@ -16,6 +16,8 @@ args = parser.parse_args()
 from prism.util.opam import OpamSwitch
 from prism.util.build_tools.strace import strace_build, _EXECUTABLE, _REGEX
 from prism.language.heuristic.parser import HeuristicParser
+import prism.util.alignment as  align
+
 from coqtop import CoqProcess
 
 coq_parser = HeuristicParser()
@@ -25,6 +27,8 @@ import logging
 import asyncio as aio
 import os
 import re
+
+
 
 
 #logging.getLogger().setLevel(logging.DEBUG)
@@ -116,11 +120,33 @@ async def get_broken_proof(flags,sentences):
     return None
 
 
+
+
 success, out = try_build(args.cmd)
 
-from repair import repair_proof
+
+async def run_multiple(n,f,*args,**kwargs):
+    tasks = []
+    for _ in range(n):
+        tasks.append(aio.create_task(f(*args,**kwargs)))
+
+
+    while len(tasks)>0:
+        done,tasks = await aio.wait(tasks,return_when=aio.FIRST_COMPLETED)
+        for x in done:
+            tmp = await x 
+            if tmp is not None:
+                for y in tasks:
+                    y.cancel()
+                return tmp
+
+    return done
+
+
 
 import random
+
+full_alignment  = align.align_factory(lambda x,y,align=align : align.fast_edit_distance(x.text,y),lambda x: len(x if type(x)==str else x.text),numba=False)
 
 while not success:
     err_file = out[-1].target
@@ -143,17 +169,54 @@ while not success:
         os.system(f"vim +{err_sentence.location.lineno+1} {err_file}")
         success, out = try_build(args.cmd)
         continue
-    else:
-        print("ok, running repair")
-        diff = subprocess.run(["git","diff"],stdout=subprocess.PIPE).stdout.decode()
-        out = aio.run(get_broken_proof(flags, sentences)) 
-        if out is None:
-            # this happens sometimes. something something parallel rebuilds.
-            print("didn't find the error in the last compiled file. trying to rebuild again.")
-            print("kill this process if we get stuck in a loop, please.")
+
+    print("ok, running repair")
+    from repair import repair_proof
+    diff = subprocess.run(["git","diff"],stdout=subprocess.PIPE).stdout.decode()
+    out = aio.run(get_broken_proof(flags, sentences)) 
+    if out is None:
+        # this happens sometimes. something something parallel rebuilds.
+        print("didn't find the error in the last compiled file. trying to rebuild again.")
+        print("kill this process if we get stuck in a loop, please.")
+        success, out = try_build(args.cmd)
+        continue
+    i,j = out
+    #new_proof = aio.run(repair_proof(sentences,i,j,diff,flags))
+
+    new_proof = aio.run(run_multiple(6,repair_proof,sentences,i,j,diff,flags,aio.Lock()))
+    
+    align = full_alignment(sentences[i:j], new_proof)
+    
+    offset = 0
+    
+    with open(err_file,"r") as f:
+        file_contents = f.read()
+
+    
+    align = [(None,"(* This proof was automatically repaired. *)")]  + align
+
+
+    write_pos = sentences[i-1].location.end_charno+1
+    for (x,y) in align:
+        if y is None:
+            y = ""
+        if x is None:
+            file_contents = file_contents[:write_pos] + f" {y} " + file_contents[write_pos:]
+            write_pos += len(y)+2
+            offset += len(y)+2
             continue
-        aio.run(repair_proof(sentences,i,j,diff,flags))
-        break
+        file_contents = file_contents[:x.location.beg_charno+offset] + y + file_contents[x.location.end_charno+1+offset:]
+        offset = offset + len(y) - (x.location.end_charno+1 - x.location.beg_charno)
+        write_pos = x.location.end_charno+1+offset
+
+    
+    with open(err_file,"w") as f:
+        f.write(file_contents)
+
+
+
+
+    success, out = try_build(args.cmd)
 
 
     
