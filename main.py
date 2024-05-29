@@ -56,8 +56,9 @@ proof_endings = ["Qed","Abort","Defined","Save","Admitted"]
 async def step_thru(flags,sentences):
     coq = CoqProcess(*flags.split())
     done = True
+    is_defined = False
     for i,s in enumerate(sentences):
-        if not done:
+        if not (done or is_defined):
             if any(s.text.strip().startswith(x) for x in proof_endings):
                 done = True
             elif s.text.strip()[0].isupper():
@@ -68,8 +69,19 @@ async def step_thru(flags,sentences):
 
         done = await coq.done()
 
-        if not done:
-            await coq.run("Admitted.")
+        if not (done or is_defined):
+            # rising edge
+            for j in range(i+1,len(sentences)):
+                if any(sentences[j].text.strip().startswith(x) for x in proof_endings):
+                    is_defined = sentences[j].text.strip().startswith("Defined")
+                    break
+            
+            if not is_defined:
+                await coq.run("Admitted.")
+
+
+        is_defined = is_defined and not done
+
 
         if "Error:" in stderr:
             coq.close()
