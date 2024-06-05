@@ -195,7 +195,7 @@ while not success:
     i,j = out
     #new_proof = aio.run(repair_proof(sentences,i,j,diff,flags))
 
-    new_proof = aio.run(run_multiple(6,repair_proof,sentences,i,j,diff,flags,aio.Lock()))
+    new_proof = aio.run(run_multiple(1,repair_proof,sentences,i,j,diff,flags,aio.Lock()))
     
     align = full_alignment(sentences[i:j], new_proof)
     
