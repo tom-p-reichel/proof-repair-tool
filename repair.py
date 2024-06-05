@@ -182,7 +182,7 @@ def unseen_test(X,s):
     return np.prod((1-C-s)/(1-C))
 
 @torch.no_grad()
-def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=1024, p = 0.01):
+def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=1024, p = 0.1):
 
     # we're gonna add fake entries
     env = env.copy()
@@ -219,7 +219,7 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=1024, p = 0.01)
     # we put it in here.
     fake_env = {}
 
-    while len(removed_probs)==0 or (continue_p := unseen_test(removed_probs,0.05)) > sample_thresh:
+    while len(removed_probs)==0 or (continue_p := unseen_test(removed_probs,0.5)) > sample_thresh:
         if tuple(stack) not in logits:
             prefix_length = 0
             for x,y in zip(cache[0],stack):
@@ -247,12 +247,16 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=1024, p = 0.01)
         # probably not a real theorem. we'll help it out.
         if len(stack)>0 and stack[-1] == UNLOOKUP_TOKEN:
             print("attempting search")
-            theorem = stack[-list(reversed(stack)).index(LOOKUP_TOKEN):-1]
             try:
+
+                theorem = stack[-list(reversed(stack)).index(LOOKUP_TOKEN):-1]
                 theorem_name = tokenizer.decode(theorem[:theorem.index(COLON_TOKEN)]).strip()
                 theorem_type = tokenizer.decode(theorem[theorem.index(COLON_TOKEN)+1:]).strip()
             except ValueError:
                 print("malformed search...")
+                continue
+
+            if theorem_name in fake_env:
                 continue
 
 
@@ -316,9 +320,7 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=1024, p = 0.01)
                     replacements[m.group(0)] = theorem_name
                 for r in replacements:
                     tactic_string = tactic_string.replace(r,replacements[r])
-                yield tactic_string
-            # trim off the ".\n```"
-            stack = stack[:-3]
+                    print("running replace",r,replacements[r])
             prob = 1.0
             for i in range(len(stack)):
                 prob *= logits[tuple(stack[:-i-1])][stack[-i-1]]
@@ -326,6 +328,8 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=1024, p = 0.01)
             removed_probs.append(prob)
             print(f"continue_p at {continue_p}")
             stack = []
+
+            yield tactic_string, prob
 
 
 
@@ -405,12 +409,14 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock):
 
     stack_manager = StackManager([x.text for x in sentences[:proof_start]], flags)
 
+    completion_cache = {}
+
     # assuming we won't more-than-double proof length
     stack = []
 
     state = await stack_manager.evaluate([])
 
-    for _ in range((proof_end-proof_start)*2):
+    while True:
 
         print(stack)
 
@@ -418,6 +424,7 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock):
         if test is not None:
             print("we did it!")
             print(test)
+            return stack
             break
         else:
             print("not done yet.")
@@ -441,13 +448,38 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock):
                 proof_history.append(f"-  {x}")
                 proof_history.append(f"+  {y}")
         
+        if ((old_cnt == proof_end-proof_start and all(x is None for x,y in alignment[-3:]))
+            or (tuple(stack) in completion_cache and (sum(completion_cache[tuple(stack)].values()) == 0))):
+            # we're either falling off the end of the old proof and we haven't solved it
+            # or we tried to find tactics to continue and utterly failed.
+            # backtracking time.
+
+            if len(stack) == 0:
+                break
+
+            # ensure we don't do this again.
+            mass = 1.0
+            for i in range(len(stack)-1,-1,-1):
+                cur_stack = tuple(stack[:i])
+                mass *= completion_cache[cur_stack][stack[i]]
+                completion_cache[cur_stack][stack[i]] -= mass
+
+
+            # aaand reset
+            stack = []
+            print("trying again...")
+            continue
+            
+
         recommendation = sentences[old_cnt+proof_start].text
         for s in sentences[old_cnt+proof_start:old_cnt+proof_start+3]:
             proof_history.append(f"?  {s.text}")
 
+
         if (await stack_manager.evaluate(stack+[recommendation])) is not None: 
             # ok, it looks like the original proof still works here.
             # we'll just take that line
+            completion_cache[tuple(stack)] = {sentences[old_cnt+proof_start].text:1.0}
             stack.append(sentences[old_cnt+proof_start].text)
             continue
 
@@ -464,12 +496,18 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock):
         async with gpu_lock:
             prompt = mkprompt(tokenizer,diff,proof_history,proof_pane)
         print(prompt)
-
-        s = sample(m,tokenizer,prompt,env)
+        
+        if prompt is None:
+            # too big to work with?!
+            completion_cache[tuple(stack)] = {}
+            continue
+        
+        s = sample(m,tokenizer,prompt,env,p=0.1)
 
         attempts = []
 
         """
+        this stub deals with
         "StopIteration interacts badly with generators and cannot be raised into a Future"
         """
         def workaround_next(gen):
@@ -478,62 +516,87 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock):
                 return x
             except StopIteration:
                 return None
-
-        while True:
-            async with gpu_lock:
-                tactic = await aio.to_thread(workaround_next,s)
-                if tactic is None:
-                    break
-
-            print(tactic)
-            # TODO: real search logic...
-
-            if tactic[0].isupper():
-                continue
-
-            if tactic[0].islower():
-                attempt = await stack_manager.evaluate(stack + [f"progress {tactic}"])
-            else:
-                attempt = await stack_manager.evaluate(stack + [tactic])
-
-            if attempt is not None:
-                attempts.append(tactic)
-
-
-        print(attempts)
         
-        # evaluate attempts
-        best = None
-        best_score = None
-        for tactic in attempts:
-            future_score = 0
-            for j in range(old_cnt+proof_start+1,proof_end):
-                res = await stack_manager.evaluate(stack+[x.text for x in sentences[old_cnt+proof_start+1:j+1]])
-                if res is not None:
-                    future_score += 1
+        
+        if tuple(stack) not in completion_cache:
+            while True:
+                async with gpu_lock:
+                    # this entire loop could be the condition for a for loop but..
+                    # 1. i want gpu lock around the iterator
+                    # 2. i want it in another thread to release the GIL &
+                    # it turns out that the to_thread thing is allergic
+                    # to StopIterator exceptions...
+                    tmp = await aio.to_thread(workaround_next,s)
+                    if tmp is None:
+                        break
+                    tactic,prob=tmp
+
+                print(tactic)
+
+                if len(tactic) == 0:
+                    continue
+
+                if tactic[0].isupper():
+                    continue
+
+                if tactic.strip()[-1] != ".":
+                    if len(tactic)>1:
+                        # not a bullet and not a sentence??
+                        continue
+
+                if tactic[0].islower():
+                    attempt = await stack_manager.evaluate(stack + [f"progress {tactic}"])
                 else:
-                    break
-            else:
-                res = await stack_manager.evaluate(stack + [x.text for x in sentences[old_cnt+proof_start+1:proof_end]] + ["Qed."])
-                if res is not None:
-                    future_score += 99999
+                    attempt = await stack_manager.evaluate(stack + [tactic])
+
+                if attempt is not None:
+                    attempts.append((tactic,prob))
+
             
-            past_score, _ = prefix_alignment([x.text for x in sentences[proof_start:proof_end]],stack + [tactic], return_cost=True)
-
-            score = (future_score,-past_score/sum(len(x) for x in stack + [tactic]))
-
-            if best_score is None or score > best_score:
-                best = tactic
-                best_score = score
-
-        print("running",best,"with score",best_score)
-
+            # evaluate attempts
+            future_scores = {}
+            for tactic,prob in attempts:
+                future_score = 0
+                for j in range(old_cnt+proof_start+1,proof_end):
+                    res = await stack_manager.evaluate(stack+[x.text for x in sentences[old_cnt+proof_start+1:j+1]])
+                    if res is not None:
+                        future_score += 1
+                    else:
+                        break
+                else:
+                    res = await stack_manager.evaluate(stack + [x.text for x in sentences[old_cnt+proof_start+1:proof_end]] + ["Qed."])
+                    if res is not None:
+                        future_score += 99999
                 
-        stack.append(best)
+                future_scores[tactic] = future_score
+
+               
+            if len(attempts)>0:
+                max_future = max(future_scores.values())
+                
+                # prune anything that doesn't have the maximal future score we found.
+                # it CAUSES some kind of detectable breakage!
+                attempts = {tactic:prob for tactic,prob in attempts if future_scores[tactic] == max_future}
+                
+                # sum up probability we're left with
+                prob_mass = sum(attempts.values())
+
+                # divide out
+                attempts = {tactic:prob/prob_mass for tactic,prob in attempts.items()}
+
+                print(attempts)
+                 
+                completion_cache[tuple(stack)] = attempts 
+            else:
+                completion_cache[tuple(stack)] = {}
+            
+
+            
+        probs = completion_cache[tuple(stack)]
+        if len(probs) > 0 and sum(probs.values()) > 0:
+            stack.append(random.choices(list(probs.keys()),weights=probs.values())[0])
 
 
 
-    else:
-        return None
 
-    return stack
+    return None
