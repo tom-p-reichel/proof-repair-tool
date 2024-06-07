@@ -169,11 +169,10 @@ def fetch_embeds(model,tok,thms):
     
     current_thms = set(thms)
 
-    keep = [(x in current_thms) for x in embed_cache[0]]
+    keep = [i for i,x in enumerate(index) if x in current_thms]
     
-    keep_order = [x for x in embed_cache[0] if x in current_thms]
     
-    return keep_order, embed_cache[1][keep]
+    return [index[x] for x in keep], embed_cache[1][keep]
 
 def unseen_test(X,s):
     if np.sum(X)+s > 1.0:
@@ -182,7 +181,7 @@ def unseen_test(X,s):
     return np.prod((1-C-s)/(1-C))
 
 @torch.no_grad()
-def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=1024, p = 0.1):
+def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=512, p = 0.1):
 
     # we're gonna add fake entries
     env = env.copy()
@@ -219,7 +218,7 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=1024, p = 0.1):
     # we put it in here.
     fake_env = {}
 
-    while len(removed_probs)==0 or (continue_p := unseen_test(removed_probs,0.5)) > sample_thresh:
+    while len(removed_probs)==0 or (continue_p := unseen_test(removed_probs,0.05)) > sample_thresh:
         if tuple(stack) not in logits:
             prefix_length = 0
             for x,y in zip(cache[0],stack):
@@ -328,6 +327,9 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=1024, p = 0.1):
             removed_probs.append(prob)
             print(f"continue_p at {continue_p}")
             stack = []
+            for x in fake_env:
+                del env[x]
+            fake_env = {}
 
             yield tactic_string, prob
 
@@ -399,9 +401,7 @@ m.set_adapter("tactic")
 
 tokenizer = AutoTokenizer.from_pretrained(f"{base_dir}/base_model/")
 
-
-
-async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock):
+async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock,recommendations=None):
     coq = CoqProcess(*flags.split())
     await coq.run("\n".join(x.text for x in sentences[:proof_start]))
     env = await coq.environment()
@@ -558,19 +558,19 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock):
             for tactic,prob in attempts:
                 future_score = 0
                 for j in range(old_cnt+proof_start+1,proof_end):
-                    res = await stack_manager.evaluate(stack+[x.text for x in sentences[old_cnt+proof_start+1:j+1]])
+                    res = await stack_manager.evaluate(stack+[tactic]+[x.text for x in sentences[old_cnt+proof_start+1:j+1]])
                     if res is not None:
                         future_score += 1
                     else:
                         break
                 else:
-                    res = await stack_manager.evaluate(stack + [x.text for x in sentences[old_cnt+proof_start+1:proof_end]] + ["Qed."])
+                    res = await stack_manager.evaluate(stack +[tactic]+ [x.text for x in sentences[old_cnt+proof_start+1:proof_end]] + ["Qed."])
                     if res is not None:
                         future_score += 99999
                 
                 future_scores[tactic] = future_score
 
-               
+            print(future_scores) 
             if len(attempts)>0:
                 max_future = max(future_scores.values())
                 
