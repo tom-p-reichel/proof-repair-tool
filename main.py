@@ -213,10 +213,17 @@ while not success:
         if y is None:
             y = ""
         if x is None:
-            file_contents = file_contents[:write_pos] + f" {y} " + file_contents[write_pos:]
-            write_pos += len(y)+2
-            offset += len(y)+2
+            file_contents = file_contents[:write_pos] + f" {y}" + file_contents[write_pos:]
+            write_pos += len(y)+1
+            offset += len(y)+1
             continue
+        if x is not None and y is not None and x.text==y:
+            xp = x.text.strip().split()
+            yp = y.strip().split()
+            if x.text.strip().split() == y.strip().split():
+                write_pos = x.location.end_charno+1+offset
+                continue
+                
         file_contents = file_contents[:x.location.beg_charno+offset] + y + file_contents[x.location.end_charno+1+offset:]
         offset = offset + len(y) - (x.location.end_charno+1 - x.location.beg_charno)
         write_pos = x.location.end_charno+1+offset
