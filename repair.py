@@ -202,6 +202,7 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=512, p = 0.1):
     UNLOOKUP_TOKEN = tokenizer.convert_tokens_to_ids("</LOOKUP>")
     COLON_TOKEN = tokenizer.convert_tokens_to_ids('▁:')
 
+
     prompt_tokens = tokenizer([prompt], return_tensors="pt")
     prompt_length = len(prompt_tokens.input_ids[0])
     tmp = model(**prompt_tokens, use_cache=True)
@@ -218,7 +219,7 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=512, p = 0.1):
     # we put it in here.
     fake_env = {}
 
-    while len(removed_probs)==0 or (continue_p := unseen_test(removed_probs,0.05)) > sample_thresh:
+    while len(removed_probs)<10 or (continue_p := unseen_test(removed_probs,0.05)) > sample_thresh:
         if tuple(stack) not in logits:
             prefix_length = 0
             for x,y in zip(cache[0],stack):
@@ -255,6 +256,7 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=512, p = 0.1):
                 print("malformed search...")
                 continue
 
+            # ???
             if theorem_name in fake_env:
                 continue
 
@@ -262,12 +264,10 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=512, p = 0.1):
             search = f"Theorem {theorem_name} : {theorem_type}."
             
             # OK, now we just.... actually search
-            model.set_adapter("search")
 
             with get_search_model(model) as search_model:
                 vec = goodinference.embed(search_model,tokenizer,[search])[0].cuda().half()
 
-            model.set_adapter("tactic")
 
             result = torch.argmax((vecs@vec).flatten())
             
@@ -392,6 +392,7 @@ base_dir = "/home/tpr/s2loop/"
 m = AutoModelForCausalLM.from_pretrained(f"{base_dir}/base_model/",device_map="auto", use_cache=False, quantization_config=bnb_config,
         attn_implementation="flash_attention_2")
 
+# do a little dance to load all the adapters
 m.load_adapter("tomreichel/proofdb-HN-CLM","search")
 m.disable_adapters()
 m.load_adapter(f"{base_dir}/model/","tactic")
@@ -400,6 +401,65 @@ m.enable_adapters()
 m.set_adapter("tactic")
 
 tokenizer = AutoTokenizer.from_pretrained(f"{base_dir}/base_model/")
+
+async def filter_tactics(stack_manager, stack, future, tactics):
+
+    attempts = []
+    for tactic,prob in tactics:
+        if len(tactic) == 0:
+            continue
+
+        if tactic[0].isupper():
+            continue
+
+        if tactic.strip()[-1] != ".":
+            if len(tactic)>1:
+                # not a bullet and not a sentence??
+                continue
+
+        if tactic[0].islower():
+            attempt = await stack_manager.evaluate(stack + [f"progress {tactic}"])
+        else:
+            # can't progress a bullet
+            attempt = await stack_manager.evaluate(stack + [tactic])
+
+        if attempt is not None:
+            attempts.append((tactic,prob))
+
+    
+    # evaluate attempts
+    future_scores = {}
+    for tactic,prob in attempts:
+        future_score = 0
+        for j in range(1,len(future)+1):
+            res = await stack_manager.evaluate(stack+[tactic]+future[:j])
+            if res is not None:
+                future_score += 1
+            else:
+                break
+
+        future_scores[tactic] = future_score
+
+    print(future_scores) 
+    if len(attempts)>0:
+        max_future = max(future_scores.values())
+        
+        # prune anything that doesn't have the maximal future score we found.
+        # it CAUSES some kind of detectable breakage!
+        attempts = {tactic:prob for tactic,prob in attempts if future_scores[tactic] == max_future}
+        
+        # sum up probability we're left with
+        prob_mass = sum(attempts.values())
+
+        # divide out
+        attempts = {tactic:prob/prob_mass for tactic,prob in attempts.items()}
+
+        print(attempts)
+         
+        return attempts
+    return {}
+    
+
 
 async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock,recommendations=None):
     coq = CoqProcess(*flags.split())
@@ -489,114 +549,36 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock,recom
         print(proof_pane)
 
         if proof_pane is None:
-            raise ValueError("previous state invalid.")
- 
-        # unfortunately, the fast tokenizer implementation
-        # is not thread safe.
-        async with gpu_lock:
-            prompt = mkprompt(tokenizer,diff,proof_history,proof_pane)
-        print(prompt)
-        
-        if prompt is None:
-            # too big to work with?!
             completion_cache[tuple(stack)] = {}
-            continue
-        
-        s = sample(m,tokenizer,prompt,env,p=0.1)
+ 
 
-        attempts = []
-
-        """
-        this stub deals with
-        "StopIteration interacts badly with generators and cannot be raised into a Future"
-        """
-        def workaround_next(gen):
-            try:
-                x = next(gen)
-                return x
-            except StopIteration:
-                return None
-        
-        
         if tuple(stack) not in completion_cache:
-            while True:
-                async with gpu_lock:
-                    # this entire loop could be the condition for a for loop but..
-                    # 1. i want gpu lock around the iterator
-                    # 2. i want it in another thread to release the GIL &
-                    # it turns out that the to_thread thing is allergic
-                    # to StopIterator exceptions...
-                    tmp = await aio.to_thread(workaround_next,s)
-                    if tmp is None:
-                        break
-                    tactic,prob=tmp
 
-                print(tactic)
-
-                if len(tactic) == 0:
-                    continue
-
-                if tactic[0].isupper():
-                    continue
-
-                if tactic.strip()[-1] != ".":
-                    if len(tactic)>1:
-                        # not a bullet and not a sentence??
-                        continue
-
-                if tactic[0].islower():
-                    attempt = await stack_manager.evaluate(stack + [f"progress {tactic}"])
-                else:
-                    attempt = await stack_manager.evaluate(stack + [tactic])
-
-                if attempt is not None:
-                    attempts.append((tactic,prob))
-
+            # unfortunately, the fast tokenizer implementation
+            # is not thread safe.
+            async with gpu_lock:
+                prompt = mkprompt(tokenizer,diff,proof_history,proof_pane)
+            print(prompt)
             
-            # evaluate attempts
-            future_scores = {}
-            for tactic,prob in attempts:
-                future_score = 0
-                for j in range(old_cnt+proof_start+1,proof_end):
-                    res = await stack_manager.evaluate(stack+[tactic]+[x.text for x in sentences[old_cnt+proof_start+1:j+1]])
-                    if res is not None:
-                        future_score += 1
-                    else:
-                        break
-                else:
-                    res = await stack_manager.evaluate(stack +[tactic]+ [x.text for x in sentences[old_cnt+proof_start+1:proof_end]] + ["Qed."])
-                    if res is not None:
-                        future_score += 99999
-                
-                future_scores[tactic] = future_score
-
-            print(future_scores) 
-            if len(attempts)>0:
-                max_future = max(future_scores.values())
-                
-                # prune anything that doesn't have the maximal future score we found.
-                # it CAUSES some kind of detectable breakage!
-                attempts = {tactic:prob for tactic,prob in attempts if future_scores[tactic] == max_future}
-                
-                # sum up probability we're left with
-                prob_mass = sum(attempts.values())
-
-                # divide out
-                attempts = {tactic:prob/prob_mass for tactic,prob in attempts.items()}
-
-                print(attempts)
-                 
-                completion_cache[tuple(stack)] = attempts 
-            else:
+            if prompt is None:
+                # too big to work with?!
                 completion_cache[tuple(stack)] = {}
-            
+                continue
+
+            s = sample(m,tokenizer,prompt,env,p=0.1)
+
+            async with gpu_lock:
+                attempts = await aio.to_thread(list,s)
+
+            print(attempts)
+
+            future = [x.text for x in sentences[old_cnt+proof_start+1:proof_end]] + ["Qed."]
+
+            completion_cache[tuple(stack)] = await filter_tactics(stack_manager,stack,future,attempts)
 
             
         probs = completion_cache[tuple(stack)]
         if len(probs) > 0 and sum(probs.values()) > 0:
             stack.append(random.choices(list(probs.keys()),weights=probs.values())[0])
-
-
-
 
     return None
