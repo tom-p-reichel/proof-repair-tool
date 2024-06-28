@@ -48,7 +48,7 @@ def try_build(cmd):
     
     builds = [x for x in out[0] if x.executable.endswith("coqc")]
 
-    return out[2]==0,builds
+    return out[1]==0,builds
 
 
 proof_endings = ["Qed","Abort","Defined","Save","Admitted"]
@@ -152,7 +152,7 @@ async def run_multiple(n,f,*args,**kwargs):
                     y.cancel()
                 return tmp
 
-    return done
+    return None
 
 
 
@@ -195,17 +195,25 @@ while not success:
     i,j = out
     #new_proof = aio.run(repair_proof(sentences,i,j,diff,flags))
 
-    new_proof = aio.run(run_multiple(1,repair_proof,sentences,i,j,diff,flags,aio.Lock()))
+    try:
+        new_proof = aio.run(aio.wait_for(run_multiple(1,repair_proof,sentences,i,j,diff,flags,aio.Lock()),300))
+    except aio.TimeoutError:
+        new_proof = None
     
-    align = full_alignment(sentences[i:j], new_proof)
-    
+
+    print(new_proof) 
+    if new_proof is not None:
+        align = full_alignment(sentences[i:j], new_proof)
+        align = [(None,"(* This proof was automatically repaired. *)")]  + align
+    else:
+        align = [(None,"(*")] + [(x,x.text) for x in sentences[i:j]] + [(sentences[j],"*)\nAdmitted.")]
+
+
+
     offset = 0
     
     with open(err_file,"r") as f:
         file_contents = f.read()
-
-    
-    align = [(None,"(* This proof was automatically repaired. *)")]  + align
 
 
     write_pos = sentences[i-1].location.end_charno+1

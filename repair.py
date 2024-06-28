@@ -19,6 +19,9 @@ import pickle
 
 import goodinference
 
+from torch import _dynamo
+_dynamo.config.verbose=True
+
 prefix_alignment  = align.align_factory(lru_cache(maxsize=30000)(lambda x,y : align.fast_edit_distance(x,y)),lambda x: len(x),select_best=lambda D: (D[:,-1].argmin(),D.shape[1]-1),numba=False)
 
 
@@ -169,10 +172,10 @@ def fetch_embeds(model,tok,thms):
     
     current_thms = set(thms)
 
-    keep = [i for i,x in enumerate(index) if x in current_thms]
+    keep = [i for i,x in enumerate(embed_cache[0]) if x in current_thms]
     
     
-    return [index[x] for x in keep], embed_cache[1][keep]
+    return [embed_cache[0][x] for x in keep], embed_cache[1][keep]
 
 def unseen_test(X,s):
     if np.sum(X)+s > 1.0:
@@ -181,7 +184,7 @@ def unseen_test(X,s):
     return np.prod((1-C-s)/(1-C))
 
 @torch.no_grad()
-def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=512, p = 0.1):
+def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=256, p = 0.1):
 
     # we're gonna add fake entries
     env = env.copy()
@@ -202,6 +205,8 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=512, p = 0.1):
     UNLOOKUP_TOKEN = tokenizer.convert_tokens_to_ids("</LOOKUP>")
     COLON_TOKEN = tokenizer.convert_tokens_to_ids('▁:')
 
+    COMMENT_TOKENS = [tokenizer.convert_tokens_to_ids('(*'), tokenizer.convert_tokens_to_ids('▁(*')] 
+
 
     prompt_tokens = tokenizer([prompt], return_tensors="pt")
     prompt_length = len(prompt_tokens.input_ids[0])
@@ -218,8 +223,10 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=512, p = 0.1):
     # when the model looks up a definition that doesn't exist and we figure out what it meant
     # we put it in here.
     fake_env = {}
-
-    while len(removed_probs)<10 or (continue_p := unseen_test(removed_probs,0.05)) > sample_thresh:
+    
+    # if you keep sampling after you've seen 99.9% of the sample space you start getting really terrible, long generations.
+    # such as the entire apache 2 license text.
+    while sum(removed_probs)<0.999 and (len(removed_probs)<10 or (continue_p := unseen_test(removed_probs,0.05)) > sample_thresh):
         if tuple(stack) not in logits:
             prefix_length = 0
             for x,y in zip(cache[0],stack):
@@ -240,6 +247,9 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=512, p = 0.1):
             cache = (tuple(stack), tmp.past_key_values)
 
         p = logits[tuple(stack)]
+        for x in COMMENT_TOKENS:
+            # do NOT open comments!
+            p[x] = 0.0
 
         stack.append(random.choices(list(p.keys()),weights=p.values())[0])
 
@@ -326,12 +336,14 @@ def sample(model,tokenizer,prompt,env,temperature=0.60,maxlength=512, p = 0.1):
                 logits[tuple(stack[:-i-1])][stack[-i-1]] -= prob
             removed_probs.append(prob)
             print(f"continue_p at {continue_p}")
+            overloaded = len(stack) > maxlength
             stack = []
             for x in fake_env:
                 del env[x]
             fake_env = {}
-
-            yield tactic_string, prob
+            if not overloaded:
+                print(tactic_string,prob)
+                yield tactic_string, prob
 
 
 
@@ -416,6 +428,9 @@ async def filter_tactics(stack_manager, stack, future, tactics):
             if len(tactic)>1:
                 # not a bullet and not a sentence??
                 continue
+
+        if "(*" in tactic or "*)" in tactic:
+            continue
 
         if tactic[0].islower():
             attempt = await stack_manager.evaluate(stack + [f"progress {tactic}"])
@@ -508,7 +523,7 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock,recom
                 proof_history.append(f"-  {x}")
                 proof_history.append(f"+  {y}")
         
-        if ((old_cnt == proof_end-proof_start and all(x is None for x,y in alignment[-3:]))
+        if ((old_cnt == proof_end-proof_start and all(x is None for x,y in alignment[-8:]))
             or (tuple(stack) in completion_cache and (sum(completion_cache[tuple(stack)].values()) == 0))):
             # we're either falling off the end of the old proof and we haven't solved it
             # or we tried to find tactics to continue and utterly failed.
@@ -568,7 +583,8 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock,recom
             s = sample(m,tokenizer,prompt,env,p=0.1)
 
             async with gpu_lock:
-                attempts = await aio.to_thread(list,s)
+                #attempts = await aio.to_thread(list,s)
+                attempts = list(s)
 
             print(attempts)
 
