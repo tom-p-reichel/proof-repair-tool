@@ -399,20 +399,20 @@ load_in_4bit=True,
 bnb_4bit_compute_dtype=torch.float16
 )
 
-base_dir = "/home/tpr/s2loop/"
-
-m = AutoModelForCausalLM.from_pretrained(f"{base_dir}/base_model/",device_map="auto", use_cache=False, quantization_config=bnb_config,
+m = AutoModelForCausalLM.from_pretrained(f"tomreichel/llemma-7b-extratok",device_map="auto", use_cache=False, quantization_config=bnb_config,
         attn_implementation="flash_attention_2")
+
+
 
 # do a little dance to load all the adapters
 m.load_adapter("tomreichel/proofdb-HN-CLM","search")
 m.disable_adapters()
-m.load_adapter(f"{base_dir}/model/","tactic")
+m.load_adapter(f"tomreichel/proof-repair-model","tactic")
 m.disable_adapters()
 m.enable_adapters()
 m.set_adapter("tactic")
 
-tokenizer = AutoTokenizer.from_pretrained(f"{base_dir}/base_model/")
+tokenizer = AutoTokenizer.from_pretrained(f"tomreichel/repair-tokenizer")
 
 async def filter_tactics(stack_manager, stack, future, tactics):
 
