@@ -399,8 +399,7 @@ load_in_4bit=True,
 bnb_4bit_compute_dtype=torch.float16
 )
 
-m = AutoModelForCausalLM.from_pretrained(f"tomreichel/llemma-7b-extratok",device_map="auto", use_cache=False, quantization_config=bnb_config,
-        attn_implementation="flash_attention_2")
+m = AutoModelForCausalLM.from_pretrained(f"tomreichel/llemma-7b-extratok",device_map="auto", use_cache=False, quantization_config=bnb_config)
 
 
 
