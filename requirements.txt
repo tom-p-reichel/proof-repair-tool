@@ -1,0 +1,10 @@
+transformers
+torch
+numpy
+tqdm
+more_itertools
+bitsandbytes
+accelerate
+coq-pearls @ git+https://github.com/tom-p-reichel/prism.git
+coqtop @ git+https://github.com/tom-p-reichel/python-coqtop.git
+goodinference @ git+https://github.com/tom-p-reichel/goodinference.git
