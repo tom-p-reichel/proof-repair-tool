@@ -22,7 +22,7 @@ async def run_multiple(how_many_times : SupportsIndex,
                        *args,**kwargs) -> Optional[T]:
     """
     schedule f_to_do how_many_times with the same arguments and keyword arguments
-    in the happy path they all return None when they finish and this entire thing returns None
+    in one path they all return None when they finish and this entire thing returns None
         after all that
     if any of them finish with something else, then cancel everything that is still going
         and return that instead

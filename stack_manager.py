@@ -59,7 +59,9 @@ class SingleContext:
     async def run_fallible_command(self, proofscript: str | StackManagerEvaluatesItem) -> \
         Tuple[Optional[NonTrivialStdOut],Optional[NonTrivialStdErr]]:
         """
-        TODO
+        the type signature of coq.run is complicated by dependence on return_stderr flag
+        so hide that from StackManager, so it gets both
+        stdout and stderr each able to be annotated as needed
         """
         stdout, stderr = await self.my_coq_process.run(proofscript, return_stderr=True)
         return stdout, stderr
@@ -67,7 +69,9 @@ class SingleContext:
     async def run_infallible_command(self, proofscript: str | StackManagerEvaluatesItem) -> \
         Optional[NonTrivialStdOut]:
         """
-        TODO
+        the type signature of coq.run is complicated by dependence on return_stderr flag
+        so hide that from StackManager, so it gets just the stdout
+        annotated as needed, ignoring stderror
         """
         stdout = await self.my_coq_process.run(proofscript, return_stderr=False)
         return stdout
@@ -75,7 +79,9 @@ class SingleContext:
 #pylint:disable=too-many-instance-attributes
 class StackManager():
     """
-    TODO
+    can do multiple evaluates
+    all have the same prefix
+    and the memoization is coordinated among them
     """
     def __init__(self,prefix : List[str],flags : str,n : int=1):
         self.stacks : Dict[StacksKeys,StacksValues] = {}
@@ -113,6 +119,8 @@ class StackManager():
         if not grab an unlocked context from self.ctxs
             with the CoqProcess therein and it's context stack
             continue or restart back to only the prefix
+            in the end of the run, that gives some output that is put into self.stacks
+            assuming no error
         None when the process running the commands in stack gave an error in stderr
         """
         if isinstance(stack,list):

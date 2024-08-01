@@ -179,7 +179,8 @@ def structural_error_from_err_file(last_out : CoqContext) -> \
 def fixup_structural_error(structural_error : BadStepThruReturns,
                            err_file: str) -> Tuple[bool,List[CoqContext]]:
     """
-    TODO
+    let the user edit the file at the place of the structural error
+    then redo the try_build
     """
     err_sentence, err_text = structural_error
     print("error found, but not in proof. please fix:")
@@ -194,7 +195,10 @@ def make_new_proof(out_ints: Tuple[int,int],
                    diff : str,
                    flags : str) -> Optional[Sequence[CoqSentence]]:
     """
-    TODO
+    do repair_proof with run_multiple so as soon as any one of them
+    produce a sequence of CoqSentence's as a nontrivial
+    RepairProofReturn, then we can stop all the other tasks still trying
+    to find answer to that same question
     """
     #pylint:disable=import-outside-toplevel
     from repair import repair_proof, RepairProofReturn
