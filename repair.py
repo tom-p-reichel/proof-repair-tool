@@ -1,14 +1,11 @@
 """
 TODO
 """
-#pylint:disable=unused-import
-from typing import NamedTuple
+from typing import Any, DefaultDict, Iterable, cast, List, Tuple, Dict, Optional
 from contextlib import contextmanager
 from pathlib import Path
 import asyncio as aio
-import math
 import pickle
-from dataclasses import dataclass
 import random
 import re
 from functools import lru_cache
@@ -16,15 +13,17 @@ from collections import defaultdict
 import numpy as np
 #pylint:disable=unused-import
 from transformers import AutoModelForCausalLM,AutoTokenizer,\
-    BitsAndBytesConfig,\
+    BitsAndBytesConfig,PreTrainedTokenizer, PreTrainedTokenizerFast,\
     StoppingCriteria,StoppingCriteriaList
 from coqtop import CoqProcess
 import more_itertools
 from tqdm import tqdm
 import torch
+from prism.language.heuristic.parser import CoqSentence
 import prism.util.alignment as  align
+from prism.util.alignment import Alignment
 import goodinference
-from torch import _dynamo
+from torch import Tensor, _dynamo
 _dynamo.config.verbose=True
 
 #pylint:disable=unnecessary-lambda
@@ -36,13 +35,19 @@ prefix_alignment  = align.align_factory(
 
 ROUGH_SENTENCE_PATTERN = re.compile(r".(?:\s|$)")
 
+type TokenizerType = PreTrainedTokenizer | PreTrainedTokenizerFast
+
+type StackManagerEvaluatesItem = Any
+type StacksKeys = Tuple[StackManagerEvaluatesItem,...]
+type StacksValues = Any
+
 #pylint:disable=too-many-instance-attributes
 class StackManager():
     """
     TODO
     """
-    def __init__(self,prefix,flags,n=1):
-        self.stacks = {}
+    def __init__(self,prefix : List[str],flags : str,n : int=1):
+        self.stacks : Dict[StacksKeys,StacksValues] = {}
         self.n = n
         self.initialized = False
         self.prefix = prefix
@@ -57,15 +62,24 @@ class StackManager():
     async def __postinit__(self):
         self.initialized = True
         #pylint:disable=attribute-defined-outside-init
-        self.ctxs = []
+        self.ctxs : List[List[Any]] = []
         for _i in range(self.n):
+            # not appending to self.ctxs[idx] but we are modifying entries of it
+            # that is why it is a heterogeneous list instead of a tuple
+            # but when we pull out the 3 pieces, we can know
+            # the first is the sort of tuple used as key in self.stacks
+            #   or at least has an equality comparison with that type, so it should be same
+            # the second is CoqProcess
+            # and the third is aio.Lock
             self.ctxs.append([(),CoqProcess(*self.flags.split(),verbose=False),aio.Lock()])
             _stdout,stderr = await self.ctxs[-1][1].run("\n".join(self.prefix), return_stderr=True)
 
             if "Error:" in stderr:
                 raise ValueError(stderr)
 
-    async def evaluate(self,stack):
+    async def evaluate(self,
+                       stack : StacksKeys | List[StackManagerEvaluatesItem]) -> \
+                        Optional[StacksValues]:
         """
         TODO
         """
@@ -80,8 +94,13 @@ class StackManager():
                     await self.__postinit__()
 
         async with self.sema:
-            ctx = next((x for x in self.ctxs if not x[2].locked()))
+            ctx = next(
+                (x for x in self.ctxs if not cast(aio.Lock,x[2]).locked())
+            )
             ctxstack,coq,ctxlock = ctx
+            coq = cast(CoqProcess,coq)
+            ctxlock = cast(aio.Lock,ctxlock)
+            ctxstack = cast(StacksKeys, ctxstack)
             async with ctxlock:
                 #pylint:disable=pointless-string-statement
                 """
@@ -120,7 +139,7 @@ class StackManager():
 
         return self.stacks[stack]
 
-def trim_kvs(kvs,l):
+def trim_kvs(kvs,l) -> Any:
     """
     TODO
     """
@@ -130,12 +149,17 @@ def trim_kvs(kvs,l):
         return kvs[:,:,:l,:]
     return kvs
 
-def process_logits(logits,temperature=0.6,topk=100):
+type ProbsKey = Any
+type ProbsValue = Any
+
+def process_logits(logits : Tensor,
+                   temperature=0.6,
+                   topk=100) -> DefaultDict[ProbsKey,ProbsValue]:
     """
     TODO
     """
     tmp = torch.topk(logits,topk)
-    probs = defaultdict(lambda:0)
+    probs = defaultdict(lambda:0.0)
     probs.update(
         zip(
             map(lambda x: x.item(),tmp.indices),
@@ -156,27 +180,41 @@ def get_search_model(model):
 
 EXCESSIVE_WHITESPACE_PATTERN = re.compile(r"(\s)\s+")
 
-def simplify_whitespace(s):
+def simplify_whitespace(s : str) -> str:
     """
     TODO
     """
     return EXCESSIVE_WHITESPACE_PATTERN.sub(" ",s.strip())
 
+type EmbedCache1Items = Any
+type EmbedCache1 = Iterable[EmbedCache1Items]
+type EmbedCache2 = Tensor | None
 
 if Path("/tmp/vector_cache.torch").exists():
     #pylint:disable=unspecified-encoding
     with open("/tmp/vector_cache_index.pk","rb") as f:
-        embed_cache = (pickle.load(f), torch.load("/tmp/vector_cache.torch"))
+        embed_cache = (
+            cast(EmbedCache1,pickle.load(f)),
+            cast(EmbedCache2,torch.load("/tmp/vector_cache.torch"))
+            )
 else:
-    embed_cache = ([],None)
+    embed_cache = (cast(List[EmbedCache1Items],[]),None)
 
-def fetch_embeds(model,tok,thms):
+embed_cache = cast(Tuple[EmbedCache1,EmbedCache2],embed_cache)
+
+type FetchEmbeds1 = EmbedCache1
+type FetchEmbeds2 = EmbedCache2
+
+def fetch_embeds(model,tok : TokenizerType,
+                 thms : Iterable[EmbedCache1Items]) -> \
+                    Tuple[FetchEmbeds1,FetchEmbeds2]:
     """
     TODO
     """
     # 1. check memory cache
     #pylint:disable=global-statement
     global embed_cache
+    embed_cache = cast(Tuple[EmbedCache1,EmbedCache2],embed_cache)
 
     index,embeds = embed_cache
 
@@ -189,7 +227,7 @@ def fetch_embeds(model,tok,thms):
 
     unembedded = list(unembedded)
 
-    vecs = goodinference.embed(
+    vecs : Tensor = goodinference.embed(
         model,tok,
         [f"Theorem {x[0].split('.')[-1]} : {simplify_whitespace(x[1])}." for x in unembedded],
         progress=True)
@@ -199,7 +237,7 @@ def fetch_embeds(model,tok,thms):
     if embed_cache[1] is None:
         embed_cache = (unembedded, vecs)
     else:
-        embed_cache = (index+unembedded, torch.vstack([embeds,vecs]))
+        embed_cache = (cast(EmbedCache1,index+unembedded), torch.vstack([embeds,vecs]))
 
     torch.save(embed_cache[1],"/tmp/vector_cache.torch")
     with open("/tmp/vector_cache_index.pk","wb") as f_for_dump:
@@ -212,7 +250,7 @@ def fetch_embeds(model,tok,thms):
 
     return [embed_cache[0][x] for x in keep], embed_cache[1][keep]
 
-def unseen_test(x_array,s):
+def unseen_test(x_array: np._ArrayLike[float],s : float) -> float:
     """
     TODO
     """
@@ -224,7 +262,13 @@ def unseen_test(x_array,s):
 
 #pylint:disable=too-many-arguments,too-many-locals,too-many-branches,too-many-statements
 @torch.no_grad()
-def sample(model,my_tokenizer,prompt,env,temperature=0.60,maxlength=256, p = 0.1):
+def sample(model,
+           my_tokenizer : TokenizerType,
+           prompt,
+           env : Dict,
+           temperature=0.60,
+           maxlength=256,
+           p = 0.1):
     """
     TODO
     """
@@ -251,7 +295,7 @@ def sample(model,my_tokenizer,prompt,env,temperature=0.60,maxlength=256, p = 0.1
 
     vecs = torch.nn.functional.normalize(vecs)
 
-    logits = {}
+    logits : Dict[Tuple,DefaultDict[ProbsKey,ProbsValue]] = {}
 
     #pylint:disable=invalid-name
     LOOKUP_TOKEN = my_tokenizer.convert_tokens_to_ids("<LOOKUP>")
@@ -272,7 +316,7 @@ def sample(model,my_tokenizer,prompt,env,temperature=0.60,maxlength=256, p = 0.1
 
     stack = []
 
-    removed_probs = []
+    removed_probs : List[float] = []
 
     continue_p = 1.0
 
@@ -375,8 +419,8 @@ def sample(model,my_tokenizer,prompt,env,temperature=0.60,maxlength=256, p = 0.1
                         [UNLOOKUP_TOKEN]
 
                     for tok in new_toks:
-                        probs = defaultdict(lambda:0)
-                        probs[tok] = 1.0
+                        probs = cast(DefaultDict[ProbsKey,ProbsValue],defaultdict(lambda:0))
+                        probs[cast(ProbsKey,tok)] = cast(ProbsValue,1.0)
                         logits[tuple(stack)] = probs
                         stack.append(tok)
 
@@ -415,8 +459,10 @@ def sample(model,my_tokenizer,prompt,env,temperature=0.60,maxlength=256, p = 0.1
                 yield tactic_string, prob
 
 
+type ChunkType = str
 
-def tokenize_glb_chunks(tok,chunks,max_acc):
+def tokenize_glb_chunks(tok: TokenizerType,
+                        chunks : Iterable[ChunkType],max_acc : int | float) -> Iterable[ChunkType]:
     """
     return `i` such that tokenizing `chunks[:i]` will not exceed `max_acc` tokens
     """
@@ -428,7 +474,11 @@ def tokenize_glb_chunks(tok,chunks,max_acc):
     return chunks
 
 
-def mkprompt(tok,diff,proof_history,proof_pane, budget=2048):
+def mkprompt(tok : TokenizerType,
+             diff : str,
+             proof_history : List[ChunkType],
+             proof_pane : Optional[StacksValues],
+             budget : int =2048) -> Optional[str]:
     """
     TODO
     """
@@ -487,12 +537,19 @@ m.set_adapter("tactic")
 
 tokenizer = AutoTokenizer.from_pretrained("tomreichel/repair-tokenizer")
 
-async def filter_tactics(stack_manager, stack, future, tactics):
+type TacticType = Any
+type ProbType = Any
+
+async def filter_tactics(stack_manager : StackManager,
+                         stack : List[StackManagerEvaluatesItem] | StacksKeys,
+                         future : List[str],
+                         tactics : Iterable[Tuple[TacticType,ProbType]]) -> \
+                            Dict[TacticType,ProbType]:
     """
     TODO
     """
 
-    attempts = []
+    attempts : List[Tuple[TacticType,ProbType]] = []
     for tactic,prob in tactics:
         if len(tactic) == 0:
             continue
@@ -519,7 +576,7 @@ async def filter_tactics(stack_manager, stack, future, tactics):
 
 
     # evaluate attempts
-    future_scores = {}
+    future_scores : Dict[TacticType,int] = {}
     for tactic,prob in attempts:
         future_score = 0
         for j in range(1,len(future)+1):
@@ -537,7 +594,9 @@ async def filter_tactics(stack_manager, stack, future, tactics):
 
         # prune anything that doesn't have the maximal future score we found.
         # it CAUSES some kind of detectable breakage!
-        attempts = {tactic:prob for tactic,prob in attempts if future_scores[tactic] == max_future}
+        attempts : Dict[TacticType,ProbType] = {
+            tactic:prob for tactic,prob in attempts
+            if future_scores[tactic] == max_future}
 
         # sum up probability we're left with
         prob_mass = sum(attempts.values())
@@ -550,9 +609,15 @@ async def filter_tactics(stack_manager, stack, future, tactics):
         return attempts
     return {}
 
+type RepairProofReturn = Optional[List[StackManagerEvaluatesItem]]
 
 #pylint:disable=too-many-branches,too-many-statements
-async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock,_recommendations=None):
+async def repair_proof(sentences : List[CoqSentence],
+                       proof_start : int,
+                       proof_end : int,
+                       diff : str,flags : str,
+                       gpu_lock : aio.Lock,
+                       _recommendations=None) -> RepairProofReturn:
     """
     TODO
     """
@@ -563,10 +628,10 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock,_reco
 
     stack_manager = StackManager([x.text for x in sentences[:proof_start]], flags)
 
-    completion_cache = {}
+    completion_cache : Dict[tuple,Dict[TacticType,ProbType]] = {}
 
     # assuming we won't more-than-double proof length
-    stack = []
+    stack : List[StackManagerEvaluatesItem] = []
 
     _state = await stack_manager.evaluate([])
 
@@ -583,7 +648,11 @@ async def repair_proof(sentences,proof_start,proof_end,diff,flags,gpu_lock,_reco
         print("not done yet.")
 
 
-        alignment = prefix_alignment([x.text for x in sentences[proof_start:proof_end]], stack)
+        alignment = cast(Alignment,
+                         prefix_alignment(
+                             [x.text for x in sentences[proof_start:proof_end]],
+                             stack,
+                             return_cost = False))
 
         old_cnt = 0
         proof_history = []

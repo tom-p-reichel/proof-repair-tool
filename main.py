@@ -9,11 +9,10 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, List, Optional, SupportsIndex, Tuple, cast
-
+from typing import Any, Callable, List, Optional, SupportsIndex, Tuple, cast, TypeVar, Sequence
 import prism.util.alignment as align_module
 from prism.util.alignment import Alignment, RightMatch
-from prism.language.heuristic.parser import HeuristicParser, CoqSentence
+from prism.language.heuristic.parser import HeuristicParser, CoqSentence, CoqComment
 #pylint:disable=unused-import
 from prism.util.build_tools.strace import (_EXECUTABLE, _REGEX, CoqContext,
                                            strace_build)
@@ -45,7 +44,7 @@ if DO_LOGGING:
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
 
-def clean():
+def clean() -> None:
     """
     TODO
     """
@@ -68,7 +67,11 @@ def try_build(command : str) -> Tuple[bool,List[CoqContext]]:
 
     return out_return_code==0,builds
 
-async def step_thru(my_flags,my_sentences : List[CoqSentence]):
+type NonTrivialStdError = Any
+type BadStepThruReturns = Tuple[CoqSentence,Optional[NonTrivialStdError]]
+type StepThruReturns = Optional[BadStepThruReturns]
+
+async def step_thru(my_flags,my_sentences : List[CoqSentence]) -> StepThruReturns:
     """
     TODO
     """
@@ -84,6 +87,7 @@ async def step_thru(my_flags,my_sentences : List[CoqSentence]):
             continue
 
         _stdout,stderr = await coq.run(cur_sentence.text,return_stderr=True)
+        stderr = cast(Optional[NonTrivialStdError],stderr)
 
         done = await coq.done()
 
@@ -91,16 +95,14 @@ async def step_thru(my_flags,my_sentences : List[CoqSentence]):
             # rising edge
             for jdx_sentence in range(idx_sentence+1,len(my_sentences)):
                 if any(
-                    my_sentences[jdx_sentence].text.strip().startswith(x)
-                    for x in PROOF_ENDINGS):
+                    my_sentences[jdx_sentence].text.strip().startswith(x) for
+                    x in PROOF_ENDINGS):
                     is_defined = my_sentences[jdx_sentence].text.strip().startswith("Defined")
                     break
             if not is_defined:
-                await coq.run("Admitted.")
-
+                _stdout = await coq.run("Admitted.")
 
         is_defined = is_defined and not done
-
 
         if "Error:" in stderr:
             coq.close()
@@ -113,7 +115,7 @@ async def step_thru(my_flags,my_sentences : List[CoqSentence]):
     coq.close()
     return None
 
-async def get_broken_proof(flags,sentences):
+async def get_broken_proof(flags,sentences) -> Optional[Tuple[int,int]]:
     """
     TODO
     """
@@ -150,7 +152,10 @@ async def get_broken_proof(flags,sentences):
 
     return None
 
-async def run_multiple(how_many_times : SupportsIndex,f_to_do : Callable,*args,**kwargs):
+T = TypeVar("T")
+async def run_multiple(how_many_times : SupportsIndex,
+                       f_to_do : Callable[...,Optional[T]],
+                       *args,**kwargs) -> Optional[T]:
     """
     schedule f_to_do how_many_times with the same arguments and keyword arguments
     in the happy path they all return None when they finish and this entire thing returns None
@@ -158,7 +163,7 @@ async def run_multiple(how_many_times : SupportsIndex,f_to_do : Callable,*args,*
     if any of them finish with something else, then cancel everything that is still going
         and return that instead
     """
-    tasks = []
+    tasks : List[aio.Task[Optional[T]]] = []
     for _ in range(how_many_times):
         tasks.append(aio.create_task(f_to_do(*args,**kwargs)))
 
@@ -173,8 +178,10 @@ async def run_multiple(how_many_times : SupportsIndex,f_to_do : Callable,*args,*
 
     return None
 
+type SentencesComments = List[CoqSentence] | Tuple[List[CoqSentence],List[CoqComment]]
+
 def structural_error_from_err_file(last_out : CoqContext) -> \
-    Optional[Tuple[CoqSentence, Optional[Any]]]:
+    Tuple[str,str,List[CoqSentence],StepThruReturns]:
     """
     TODO
     """
@@ -183,15 +190,18 @@ def structural_error_from_err_file(last_out : CoqContext) -> \
         err_file = err_file + ".v"
     print("looking at",err_file)
 
-    sentences = HeuristicParser.parse_sentences_from_file(
-        err_file, return_locations=True, glom_proofs=False)
+    sentences = \
+        cast(List[CoqSentence],
+             HeuristicParser.parse_sentences_from_file(
+                 err_file, return_locations=True, glom_proofs=False))
 
     flags = str(last_out.serapi_options)
 
     structural_error = aio.run(step_thru(flags, sentences))
     return err_file, flags, sentences, structural_error
 
-def fixup_structural_error(structural_error, err_file) -> Tuple[bool,List[CoqContext]]:
+def fixup_structural_error(structural_error : BadStepThruReturns,
+                           err_file: str) -> Tuple[bool,List[CoqContext]]:
     """
     TODO
     """
@@ -203,17 +213,21 @@ def fixup_structural_error(structural_error, err_file) -> Tuple[bool,List[CoqCon
     success, out = try_build(script_args.cmd)
     return success, out
 
-def make_new_proof(out_ints: Tuple[int,int], sentences, diff, flags):
+def make_new_proof(out_ints: Tuple[int,int],
+                   sentences : List[CoqSentence],
+                   diff : str,
+                   flags : str) -> Optional[Sequence[CoqSentence]]:
     """
     TODO
     """
     #pylint:disable=import-outside-toplevel
-    from repair import repair_proof
+    from repair import repair_proof, RepairProofReturn
     i, j = out_ints
     try:
-        new_proof = aio.run(
+        new_proof : Optional[RepairProofReturn] = aio.run(
             aio.wait_for(
-                run_multiple(1,repair_proof,sentences,i,j,diff,flags,aio.Lock()),300
+                fut=run_multiple(1,repair_proof,sentences,i,j,diff,flags,aio.Lock()),
+                timeout=300
                 )
             )
     except aio.TimeoutError:
@@ -221,7 +235,7 @@ def make_new_proof(out_ints: Tuple[int,int], sentences, diff, flags):
     return new_proof
 
 #pylint:disable=too-many-locals
-def main_running_loop():
+def main_running_loop() -> None:
     """
     TODO
     """
@@ -254,11 +268,11 @@ def main_running_loop():
 
         print(new_proof)
         if new_proof is not None:
-            align = cast(Alignment,
+            align = cast(Alignment[CoqSentence],
                          full_alignment(sentences[i:j], new_proof, return_cost = False))
-            new_part = cast(RightMatch,
+            new_part = cast(RightMatch[CoqSentence],
                             (None,"(* This proof was automatically repaired. *)"))
-            align = cast(Alignment,[new_part] + align)
+            align = cast(Alignment[CoqSentence],[new_part] + align)
         else:
             align = cast(Alignment,[(None,"(*")] + \
                 [(x,x.text) for x in sentences[i:j]] + \
