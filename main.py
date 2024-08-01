@@ -2,6 +2,8 @@
 python {this script} make
 Makefile of where above done has the relevant .v Coq file
 """
+# Standard/General Purpose Imports
+from typing import Any, List, Optional, Tuple, cast, Sequence
 import argparse
 import asyncio as aio
 import logging
@@ -9,15 +11,13 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, List, Optional, SupportsIndex, Tuple, cast, TypeVar, Sequence
+
+# Coq Specific Imports
 import prism.util.alignment as align_module
 from prism.util.alignment import Alignment, RightMatch
 from prism.language.heuristic.parser import HeuristicParser, CoqSentence, CoqComment
-#pylint:disable=unused-import
-from prism.util.build_tools.strace import (_EXECUTABLE, _REGEX, CoqContext,
-                                           strace_build)
+from prism.util.build_tools.strace import CoqContext, strace_build
 from prism.util.opam import OpamSwitch
-
 from coqtop import CoqProcess
 
 DO_LOGGING = False
@@ -115,7 +115,9 @@ async def step_thru(my_flags,my_sentences : List[CoqSentence]) -> StepThruReturn
     coq.close()
     return None
 
-async def get_broken_proof(flags,sentences) -> Optional[Tuple[int,int]]:
+async def get_broken_proof(flags : str,
+                           sentences : List[CoqSentence]) -> \
+                            Optional[Tuple[int,int]]:
     """
     TODO
     """
@@ -149,32 +151,6 @@ async def get_broken_proof(flags,sentences) -> Optional[Tuple[int,int]]:
     for jdx_sentence in range(last_proof+1, len(sentences)):
         if any(sentences[jdx_sentence].text.startswith(x) for x in  PROOF_ENDINGS):
             return (last_proof,jdx_sentence)
-
-    return None
-
-T = TypeVar("T")
-async def run_multiple(how_many_times : SupportsIndex,
-                       f_to_do : Callable[...,Optional[T]],
-                       *args,**kwargs) -> Optional[T]:
-    """
-    schedule f_to_do how_many_times with the same arguments and keyword arguments
-    in the happy path they all return None when they finish and this entire thing returns None
-        after all that
-    if any of them finish with something else, then cancel everything that is still going
-        and return that instead
-    """
-    tasks : List[aio.Task[Optional[T]]] = []
-    for _ in range(how_many_times):
-        tasks.append(aio.create_task(f_to_do(*args,**kwargs)))
-
-    while len(tasks)>0:
-        done,tasks = await aio.wait(tasks,return_when=aio.FIRST_COMPLETED)
-        for cur_done in done:
-            tmp = await cur_done
-            if tmp is not None:
-                for cur_ongoing in tasks:
-                    cur_ongoing.cancel()
-                return tmp
 
     return None
 
@@ -222,6 +198,7 @@ def make_new_proof(out_ints: Tuple[int,int],
     """
     #pylint:disable=import-outside-toplevel
     from repair import repair_proof, RepairProofReturn
+    from general import run_multiple
     i, j = out_ints
     try:
         new_proof : Optional[RepairProofReturn] = aio.run(

@@ -1,29 +1,35 @@
 """
 TODO
 """
+# Standard/General Purpose Imports
 from typing import Any, DefaultDict, Iterable, cast, List, Tuple, Dict, Optional
 from contextlib import contextmanager
 from pathlib import Path
 import asyncio as aio
 import pickle
-import random
 import re
 from functools import lru_cache
 from collections import defaultdict
-import numpy as np
-#pylint:disable=unused-import
-from transformers import AutoModelForCausalLM,AutoTokenizer,\
-    BitsAndBytesConfig,PreTrainedTokenizer, PreTrainedTokenizerFast,\
-    StoppingCriteria,StoppingCriteriaList
-from coqtop import CoqProcess
-import more_itertools
-from tqdm import tqdm
+
+# Tensors and Transformers Imports
 import torch
+from torch import Tensor, _dynamo
+import goodinference
+from transformers import AutoModelForCausalLM,AutoTokenizer,\
+    BitsAndBytesConfig,PreTrainedTokenizer, PreTrainedTokenizerFast
+
+# Coq Specific Imports
+from coqtop import CoqProcess
 from prism.language.heuristic.parser import CoqSentence
 import prism.util.alignment as  align
 from prism.util.alignment import Alignment
-import goodinference
-from torch import Tensor, _dynamo
+
+# Locally within Proof Repair Imports
+from general import ProbsKey, ProbsValue, one_random_choice,\
+    process_logits, simplify_whitespace, unseen_test
+from stack_manager import StackManager, StackManagerEvaluatesItem,\
+    StacksKeys, StacksValues
+
 _dynamo.config.verbose=True
 
 #pylint:disable=unnecessary-lambda
@@ -37,108 +43,6 @@ ROUGH_SENTENCE_PATTERN = re.compile(r".(?:\s|$)")
 
 type TokenizerType = PreTrainedTokenizer | PreTrainedTokenizerFast
 
-type StackManagerEvaluatesItem = Any
-type StacksKeys = Tuple[StackManagerEvaluatesItem,...]
-type StacksValues = Any
-
-#pylint:disable=too-many-instance-attributes
-class StackManager():
-    """
-    TODO
-    """
-    def __init__(self,prefix : List[str],flags : str,n : int=1):
-        self.stacks : Dict[StacksKeys,StacksValues] = {}
-        self.n = n
-        self.initialized = False
-        self.prefix = prefix
-
-        self.offset = len(prefix)+1
-
-        self.flags = flags
-
-        self.sema = aio.Semaphore(n)
-        self.biglock = aio.Lock()
-
-    async def __postinit__(self):
-        self.initialized = True
-        #pylint:disable=attribute-defined-outside-init
-        self.ctxs : List[List[Any]] = []
-        for _i in range(self.n):
-            # not appending to self.ctxs[idx] but we are modifying entries of it
-            # that is why it is a heterogeneous list instead of a tuple
-            # but when we pull out the 3 pieces, we can know
-            # the first is the sort of tuple used as key in self.stacks
-            #   or at least has an equality comparison with that type, so it should be same
-            # the second is CoqProcess
-            # and the third is aio.Lock
-            self.ctxs.append([(),CoqProcess(*self.flags.split(),verbose=False),aio.Lock()])
-            _stdout,stderr = await self.ctxs[-1][1].run("\n".join(self.prefix), return_stderr=True)
-
-            if "Error:" in stderr:
-                raise ValueError(stderr)
-
-    async def evaluate(self,
-                       stack : StacksKeys | List[StackManagerEvaluatesItem]) -> \
-                        Optional[StacksValues]:
-        """
-        TODO
-        """
-        if isinstance(stack,list):
-            stack = tuple(stack)
-        if stack in self.stacks:
-            return self.stacks[stack]
-
-        if not self.initialized:
-            async with self.biglock:
-                if not self.initialized:
-                    await self.__postinit__()
-
-        async with self.sema:
-            ctx = next(
-                (x for x in self.ctxs if not cast(aio.Lock,x[2]).locked())
-            )
-            ctxstack,coq,ctxlock = ctx
-            coq = cast(CoqProcess,coq)
-            ctxlock = cast(aio.Lock,ctxlock)
-            ctxstack = cast(StacksKeys, ctxstack)
-            async with ctxlock:
-                #pylint:disable=pointless-string-statement
-                """
-                for a in stack:
-                    # POISON. if we lose track of sentence counts the entire context breaks.
-                    if len(ROUGH_SENTENCE_PATTERN.findall(a)) > 1:
-                        return None
-                """
-                if stack[:len(ctxstack)] == ctxstack:
-                    # we're just adding commands
-                    for j,new_command in enumerate(stack[len(ctxstack):]):
-                        _stdout,stderr = await coq.run(new_command,return_stderr=True)
-                        if "Error" in stderr:
-                            ctx[0] = ctxstack + stack[len(ctxstack):len(ctxstack)+j]
-                            self.stacks[stack] = None
-                            break
-                    else:
-                        ctx[0] = stack
-                        self.stacks[stack] = await coq.run("Show.")
-                else:
-                    _stdout,stderr = await coq.run(
-                        f"BackTo {self.offset}.\n"+\
-                            "\n".join(f"timeout 1 {x}" if x[0].islower() else x  for x in stack),
-                            return_stderr=True)
-                    output = await coq.run("Show.")
-
-                    #pylint:disable=no-else-return
-                    if "Error" in stderr:
-                        self.stacks[stack]=None
-                        ctx[0] = ()
-                        await coq.run(f"BackTo {self.offset}.")
-                        return None
-                    else:
-                        ctx[0] = stack
-                        self.stacks[stack] = output
-
-        return self.stacks[stack]
-
 def trim_kvs(kvs,l) -> Any:
     """
     TODO
@@ -148,24 +52,6 @@ def trim_kvs(kvs,l) -> Any:
     if isinstance(kvs,torch.Tensor):
         return kvs[:,:,:l,:]
     return kvs
-
-type ProbsKey = Any
-type ProbsValue = Any
-
-def process_logits(logits : Tensor,
-                   temperature=0.6,
-                   topk=100) -> DefaultDict[ProbsKey,ProbsValue]:
-    """
-    TODO
-    """
-    tmp = torch.topk(logits,topk)
-    probs = defaultdict(lambda:0.0)
-    probs.update(
-        zip(
-            map(lambda x: x.item(),tmp.indices),
-            map(lambda x: x.item(),
-                torch.nn.functional.softmax(tmp.values/temperature))))
-    return probs
 
 @contextmanager
 def get_search_model(model):
@@ -177,14 +63,6 @@ def get_search_model(model):
         yield model.model
     finally:
         model.set_adapter("tactic")
-
-EXCESSIVE_WHITESPACE_PATTERN = re.compile(r"(\s)\s+")
-
-def simplify_whitespace(s : str) -> str:
-    """
-    TODO
-    """
-    return EXCESSIVE_WHITESPACE_PATTERN.sub(" ",s.strip())
 
 type EmbedCache1Items = Any
 type EmbedCache1 = Iterable[EmbedCache1Items]
@@ -249,16 +127,6 @@ def fetch_embeds(model,tok : TokenizerType,
 
 
     return [embed_cache[0][x] for x in keep], embed_cache[1][keep]
-
-def unseen_test(x_array: np._ArrayLike[float],s : float) -> float:
-    """
-    TODO
-    """
-    if np.sum(x_array)+s > 1.0:
-        return 0.0
-    #pylint:disable=invalid-name
-    C = np.cumsum(np.concatenate([[0],x_array[:-1]]))
-    return np.prod((1-C-s)/(1-C))
 
 #pylint:disable=too-many-arguments,too-many-locals,too-many-branches,too-many-statements
 @torch.no_grad()
@@ -358,7 +226,9 @@ def sample(model,
             # do NOT open comments!
             p[x] = 0.0
 
-        stack.append(random.choices(list(p.keys()),weights=p.values())[0])
+        stack.append(one_random_choice(
+            population=list(p.keys()),
+            weights=p.values()))
 
         # model just finished typing the name+type
         # of a theorem in the environment that we couldn't find.
@@ -455,8 +325,16 @@ def sample(model,
                 del env[x]
             fake_env = {}
             if not overloaded:
+                # when overloaded only then is tactic_string unbound
+                tactic_string = cast(str,tactic_string)
                 print(tactic_string,prob)
                 yield tactic_string, prob
+    #pylint:disable=pointless-string-statement
+    """
+    Stopped the while loop because either
+    - sum(removed_probs)>=.999
+    - len(removed_probs)>=10 and the unseen test gave something below threshold
+    """
 
 
 type ChunkType = str
@@ -622,7 +500,7 @@ async def repair_proof(sentences : List[CoqSentence],
     TODO
     """
     coq = CoqProcess(*flags.split())
-    await coq.run("\n".join(x.text for x in sentences[:proof_start]))
+    _stdout = await coq.run("\n".join(x.text for x in sentences[:proof_start]), return_stderr=False)
     env = await coq.environment()
     coq.close()
 
@@ -744,6 +622,9 @@ async def repair_proof(sentences : List[CoqSentence],
 
         probs = completion_cache[tuple(stack)]
         if len(probs) > 0 and sum(probs.values()) > 0:
-            stack.append(random.choices(list(probs.keys()),weights=probs.values())[0])
+            stack.append(one_random_choice(
+                population=list(probs.keys()),
+                weights=probs.values()
+            ))
 
     return None
