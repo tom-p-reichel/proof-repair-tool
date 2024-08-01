@@ -3,11 +3,12 @@ isolate stack manager
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Tuple
 import asyncio as aio
 from coqtop import CoqProcess
 
 type NonTrivialStdOut = Any
+type NonTrivialStdErr = Any
 type StackManagerEvaluatesItem = Any # useable as proofscript argument in coq.run
 type StacksKeys = Tuple[StackManagerEvaluatesItem,...]
 type StacksValues = Optional[NonTrivialStdOut]
@@ -33,6 +34,43 @@ class SingleContext:
         replace my_single_stack
         """
         self.my_single_stack = new_stack
+
+    def append_stack(self, more_stack : StacksKeys):
+        """
+        tuple addition on my_single_stack
+        """
+        self.my_single_stack = self.my_single_stack + more_stack
+
+    def can_just_add_more(self, more_stack: StacksKeys) -> Optional[int]:
+        """
+        self.my_single_stack is just a prefix of more_stack
+        continue on from the given index in more_stack
+        """
+        len_my_single_stack = len(self.my_single_stack)
+        if len(more_stack)<len_my_single_stack:
+            return None
+        is_prefix = all(
+            more_stack[idx] == self.my_single_stack[idx]
+            for idx in range(len_my_single_stack))
+        if is_prefix:
+            return len_my_single_stack
+        return None
+
+    async def run_fallible_command(self, proofscript: str | StackManagerEvaluatesItem) -> \
+        Tuple[Optional[NonTrivialStdOut],Optional[NonTrivialStdErr]]:
+        """
+        TODO
+        """
+        stdout, stderr = await self.my_coq_process.run(proofscript, return_stderr=True)
+        return stdout, stderr
+
+    async def run_infallible_command(self, proofscript: str | StackManagerEvaluatesItem) -> \
+        Optional[NonTrivialStdOut]:
+        """
+        TODO
+        """
+        stdout = await self.my_coq_process.run(proofscript, return_stderr=False)
+        return stdout
 
 #pylint:disable=too-many-instance-attributes
 class StackManager():
@@ -96,8 +134,7 @@ class StackManager():
                 # the semaphore should have ensured that
                 # at least one of self.ctxs was not locked
                 raise e
-            ctxstack,coq,ctxlock = ctx.unpack()
-            async with ctxlock:
+            async with ctx.lock:
                 #pylint:disable=pointless-string-statement
                 """
                 for a in stack:
@@ -105,32 +142,28 @@ class StackManager():
                     if len(ROUGH_SENTENCE_PATTERN.findall(a)) > 1:
                         return None
                 """
-                if stack[:len(ctxstack)] == ctxstack:
-                    # we're just adding commands
-                    for j,new_command in enumerate(stack[len(ctxstack):]):
-                        _stdout,stderr = await coq.run(new_command,return_stderr=True)
+                if (where_to_continue := ctx.can_just_add_more(stack)) is not None:
+                    for j,new_command in enumerate(stack[where_to_continue:]):
+                        _stdout,stderr = await ctx.run_fallible_command(new_command)
                         if "Error" in stderr:
-                            ctx.set_stack(ctxstack + stack[len(ctxstack):len(ctxstack)+j])
+                            ctx.append_stack(stack[where_to_continue:where_to_continue+j])
                             self.stacks[stack] = None
                             break
                     else:
                         # we successfully added all the commands
                         ctx.set_stack(stack)
-                        self.stacks[stack] = cast(Optional[NonTrivialStdOut],
-                                                  await coq.run("Show.",return_stderr=False))
+                        self.stacks[stack] = await ctx.run_infallible_command("Show.")
                 else:
-                    _stdout,stderr = await coq.run(
+                    _stdout,stderr = await ctx.run_fallible_command(
                         f"BackTo {self.offset}.\n"+\
-                            "\n".join(f"timeout 1 {x}" if x[0].islower() else x  for x in stack),
-                            return_stderr=True)
-                    output = cast(Optional[NonTrivialStdOut],
-                                  await coq.run("Show.",return_stderr=False))
+                            "\n".join(f"timeout 1 {x}" if x[0].islower() else x  for x in stack))
+                    output = await ctx.run_infallible_command("Show.")
 
                     #pylint:disable=no-else-return
                     if "Error" in stderr:
                         self.stacks[stack]=None
                         ctx.set_stack(())
-                        await coq.run(f"BackTo {self.offset}.")
+                        _ = await ctx.run_infallible_command(f"BackTo {self.offset}.")
                         return None
                     else:
                         ctx.set_stack(stack)

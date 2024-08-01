@@ -2,11 +2,12 @@
 functions not specific to Coq or proofs
 such as for general async
 """
-
+from typing import Callable, DefaultDict, List, Optional, Protocol,\
+    Sequence, SupportsIndex, TypeVar, cast
 from collections import defaultdict
 from random import choices as random_choices
 import re
-from typing import Callable, DefaultDict, List, Optional, Sequence, SupportsIndex, TypeVar, cast
+
 import asyncio as aio
 
 import numpy as np
@@ -42,13 +43,18 @@ async def run_multiple(how_many_times : SupportsIndex,
     return None
 
 
-type ProbsKey = Number
-type ProbsValue = Number
+type ProbsKey = Number # an integral index into logits
+type ProbsValue = Number # a probability in [0,1]
+# the type information of x.item() is not enough
+# to say that one should be integral
+# and the later unit interval valued
 def process_logits(logits : Tensor,
                    temperature=0.6,
                    topk=100) -> DefaultDict[ProbsKey,ProbsValue]:
     """
-    TODO
+    get the top k values in logits and their indices
+    consider that as energies of that system
+    and give the Boltzmann weights on those indices
     """
     tmp = torch.topk(logits,topk)
     probs : DefaultDict[ProbsKey,ProbsValue] = defaultdict(lambda:cast(ProbsValue,0.0))
@@ -62,16 +68,29 @@ def process_logits(logits : Tensor,
 EXCESSIVE_WHITESPACE_PATTERN = re.compile(r"(\s)\s+")
 def simplify_whitespace(s : str) -> str:
     """
-    TODO
+    get rid of the boomer 2 spaces after a period (legacy of typewriter education) and similar
     """
     return EXCESSIVE_WHITESPACE_PATTERN.sub(" ",s.strip())
 
+_T_co = TypeVar("_T_co", covariant=True)
+class SupportsLenAndGetItem(Protocol[_T_co]):
+    """
+    bound needed by random.choices
+    """
+    def __len__(self) -> int: ...
+    def __getitem__(self, k: int, /) -> _T_co: ...
+
 T = TypeVar("T")
-def one_random_choice(population: List[T], weights : Optional[Sequence[float]] = None) -> T:
+def one_random_choice(population: SupportsLenAndGetItem[T],
+                      weights : Optional[Sequence[float]] = None,
+                      cum_weights: Sequence[float] | None = None) -> T:
     """
     first from random.choices
+    entries of weights and cum_weights sequences should should also be allowed
+        to be Fraction in addition to float, but that type definition is missing
+        though it appears as the annotation in some places
     """
-    return random_choices(population,weights=weights)[0]
+    return random_choices(population,weights=weights,cum_weights=cum_weights,k=1)[0]
 
 def unseen_test(x_array: np._ArrayLike[float],s : float) -> float:
     """
