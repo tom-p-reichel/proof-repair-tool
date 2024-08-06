@@ -111,28 +111,16 @@ class StackManager():
             if "Error:" in stderr:
                 raise ValueError(stderr)
 
-    async def evaluate(self,
-                       stack : StacksKeys | List[StackManagerEvaluatesItem]) -> \
-                        Optional[StacksValues]:
+    async def __evaluate_hard_work(self, stack : StacksKeys) -> \
+        Optional[StacksValues]:
         """
-        if already have stack in self.stacks then return the associated value
-        if not grab an unlocked context from self.ctxs
+        grab an unlocked context from self.ctxs
             with the CoqProcess therein and it's context stack
             continue or restart back to only the prefix
             in the end of the run, that gives some output that is put into self.stacks
             assuming no error
         None when the process running the commands in stack gave an error in stderr
         """
-        if isinstance(stack,list):
-            stack = tuple(stack)
-        if stack in self.stacks:
-            return self.stacks[stack]
-
-        if not self.initialized:
-            async with self.biglock:
-                if not self.initialized:
-                    await self.__postinit__()
-
         async with self.sema:
             try:
                 ctx = next(
@@ -176,5 +164,31 @@ class StackManager():
                     else:
                         ctx.set_stack(stack)
                         self.stacks[stack] = output
+            # end async with ctx.lock
+        # end async with the semaphore
+
+    async def evaluate(self,
+                       stack : StacksKeys | List[StackManagerEvaluatesItem]) -> \
+                        Optional[StacksValues]:
+        """
+        if already have stack in self.stacks then return the associated value
+        if not grab an unlocked context from self.ctxs
+            with the CoqProcess therein and it's context stack
+            continue or restart back to only the prefix
+            in the end of the run, that gives some output that is put into self.stacks
+            assuming no error
+        None when the process running the commands in stack gave an error in stderr
+        """
+        if isinstance(stack,list):
+            stack = tuple(stack)
+        if stack in self.stacks:
+            return self.stacks[stack]
+
+        if not self.initialized:
+            async with self.biglock:
+                if not self.initialized:
+                    await self.__postinit__()
+
+        await self.__evaluate_hard_work(stack)
 
         return self.stacks[stack]
